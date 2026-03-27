@@ -1,4 +1,4 @@
-# JSthon
+# JSthon ![version](https://img.shields.io/badge/version-1.0.0-blue)
 
 JSthon is a lightweight Python interpreter written in JavaScript that runs directly in the browser. It features a custom lexical tokenizer and an environment-based scoping system to mimic Python's execution model.
 

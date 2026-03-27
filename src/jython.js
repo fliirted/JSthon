@@ -557,4 +557,4 @@ async function runCompiler() {
     await executeBlock(sourceLines, globalEnv, 1);
 }
 
-console.log("Powered by JSthon");
+console.log("Powered by JSthon v1.0.0");
