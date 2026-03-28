@@ -43,25 +43,100 @@ async function runCompiler() {
     consoleDiv.innerText = '';
     const globalEnv = new Environment();
 
+    // --- helpers ---
+
+    function pyRepr(v) {
+        if (v === null) return 'None';
+        if (v === true) return 'True';
+        if (v === false) return 'False';
+        if (Array.isArray(v)) return '[' + v.map(pyRepr).join(', ') + ']';
+        if (v && typeof v === 'object') {
+            if (v.__type__ === 'dict') {
+                const pairs = Object.keys(v.data).map(k => `${pyRepr(isNaN(k) ? k : Number(k))}: ${pyRepr(v.data[k])}`);
+                return '{' + pairs.join(', ') + '}';
+            }
+            if (v.__type__ === 'set') return '{' + [...v.data].map(pyRepr).join(', ') + '}';
+            if (v.__type__ === 'tuple') return '(' + v.data.map(pyRepr).join(', ') + (v.data.length === 1 ? ',' : '') + ')';
+            if (v.__type__ === 'frozenset') return 'frozenset({' + [...v.data].map(pyRepr).join(', ') + '})';
+            if (v.__type__ === 'bytes') return "b'" + [...v.data].map(b => '\\x' + b.toString(16).padStart(2, '0')).join('') + "'";
+            if (v.__type__ === 'complex') return `(${v.real}+${v.imag}j)`;
+            if (v.__type__ === 'slice') return `slice(${v.start}, ${v.stop}, ${v.step})`;
+            if (v.stop !== undefined) return v.step !== 1 ? `range(${v.start}, ${v.stop}, ${v.step})` : `range(${v.start}, ${v.stop})`;
+            return String(v);
+        }
+        if (typeof v === 'string') return `'${v}'`;
+        return String(v);
+    }
+
+    // Python str() of a value (no quotes on strings)
+    function pyStr(v) {
+        if (v === null) return 'None';
+        if (v === true) return 'True';
+        if (v === false) return 'False';
+        if (typeof v === 'string') return v;
+        return pyRepr(v);
+    }
+
+    /// Truthiness matching
+    function pyBool(v) {
+        if (v === null || v === false || v === 0 || v === 0n) return false;
+        if (typeof v === 'string' && v.length === 0) return false;
+        if (Array.isArray(v) && v.length === 0) return false;
+        if (v && typeof v === 'object') {
+            if (v.__type__ === 'dict' && Object.keys(v.data).length === 0) return false;
+            if ((v.__type__ === 'set' || v.__type__ === 'frozenset') && v.data.size === 0) return false;
+            if (v.__type__ === 'tuple' && v.data.length === 0) return false;
+        }
+        return true;
+    }
+
+    function wrap(value, type) { return { value, type }; }
+
+    // Iterate anything iterable 
+    function iterValues(obj) {
+        if (Array.isArray(obj)) return obj;
+        if (typeof obj === 'string') return [...obj];
+        if (obj && typeof obj === 'object') {
+            if (obj.__type__ === 'tuple' || obj.__type__ === 'list_view') return obj.data;
+            if (obj.__type__ === 'set' || obj.__type__ === 'frozenset') return [...obj.data];
+            if (obj.__type__ === 'dict') return Object.keys(obj.data).map(k => isNaN(k) ? k : Number(k));
+            if (obj.stop !== undefined) { // range
+                const vals = [];
+                const { start, stop, step } = obj;
+                if (step > 0) { for (let v = start; v < stop; v += step) vals.push(v); }
+                else { for (let v = start; v > stop; v += step) vals.push(v); }
+                return vals;
+            }
+        }
+        throw new Error(`TypeError: object is not iterable`);
+    }
+
+    async function callFunction(fnObj, args, env) {
+        if (fnObj.type === 'builtin') return await fnObj.value(args);
+        if (fnObj.type !== 'func') throw new Error(`TypeError: object is not callable`);
+        const { params, body: fnBody, closure } = fnObj.value;
+        const fnEnv = new Environment(closure, true);
+        for (let pi = 0; pi < params.length; pi++) {
+            const { name: pname, defaultExpr } = params[pi];
+            if (pi < args.length) fnEnv.set(pname, args[pi]);
+            else if (defaultExpr !== null) fnEnv.set(pname, await evaluate(defaultExpr, closure));
+            else throw new Error(`TypeError: missing required argument '${pname}'`);
+        }
+        try {
+            await executeBlock(fnBody, fnEnv);
+            return wrap(null, 'None');
+        } catch (ret) {
+            if (ret && ret.__return__) return ret.typedResult ?? wrap(ret.value, 'obj');
+            throw ret;
+        }
+    }
+
     function outputToConsole(text) {
         const line = document.createElement('div');
-        const format = (v) => {
-            if (v === null) return 'None';
-            if (v === true) return 'True';
-            if (v === false) return 'False';
-            if (Array.isArray(v)) return '[' + v.map(format).join(', ') + ']';
-            if (typeof v === 'string') return `'${v}'`;
-            if (v && typeof v === 'object' && v.stop !== undefined) {
-                return v.step !== 1
-                    ? `range(${v.start}, ${v.stop}, ${v.step})`
-                    : `range(${v.start}, ${v.stop})`;
-            }
-            return v;
-        };
         if (Array.isArray(text)) {
-            line.textContent = text.map(item => typeof item === 'string' ? item : format(item)).join(' ');
+            line.textContent = text.map(item => typeof item === 'string' ? item : pyStr(item)).join(' ');
         } else {
-            line.textContent = format(text);
+            line.textContent = pyStr(text);
         }
         consoleDiv.appendChild(line);
     }
@@ -85,20 +160,13 @@ async function runCompiler() {
                 }
                 const exprStr = inner.slice(i + 1, j - 1);
                 const val = await evaluate(exprStr, env);
-                const fmt = (v) => {
-                    if (v === null) return 'None';
-                    if (v === true) return 'True';
-                    if (v === false) return 'False';
-                    if (Array.isArray(v)) return '[' + v.map(fmt).join(', ') + ']';
-                    return String(v);
-                };
-                result += fmt(val.value);
+                result += pyStr(val.value);
                 i = j;
             } else {
                 result += inner[i++];
             }
         }
-        return { value: result, type: 'str' };
+        return wrap(result, 'str');
     }
 
     // --- parser ---
@@ -106,15 +174,11 @@ async function runCompiler() {
         const params = [];
         let cur = '', depth = 0, inStr = false, strChar = '';
         const flush = () => {
-            const part = cur.trim();
-            cur = '';
+            const part = cur.trim(); cur = '';
             if (!part) return;
             const eqIdx = part.indexOf('=');
-            if (eqIdx !== -1) {
-                params.push({ name: part.slice(0, eqIdx).trim(), defaultExpr: part.slice(eqIdx + 1).trim() });
-            } else {
-                params.push({ name: part, defaultExpr: null });
-            }
+            if (eqIdx !== -1) params.push({ name: part.slice(0, eqIdx).trim(), defaultExpr: part.slice(eqIdx + 1).trim() });
+            else params.push({ name: part, defaultExpr: null });
         };
         for (let i = 0; i <= paramStr.length; i++) {
             const c = paramStr[i];
@@ -123,19 +187,492 @@ async function runCompiler() {
             else if (c === '"' || c === "'") { inStr = true; strChar = c; cur += c; }
             else if (c === '(' || c === '[') { depth++; cur += c; }
             else if (c === ')' || c === ']') { depth--; cur += c; }
-            else if (c === ',' && depth === 0) { flush(); }
-            else { cur += c; }
+            else if (c === ',' && depth === 0) flush();
+            else cur += c;
         }
         return params;
     }
 
+    // --- built-in function table ---
+    function makeBuiltins(env, globalEnv) {
+        // gets a "key function"
+        const B = {};
+
+        // abs
+        B.abs = async ([a]) => wrap(Math.abs(a.value), a.type);
+
+        // all
+        B.all = async ([it]) => wrap(iterValues(it.value).every(v => pyBool(v)), 'bool');
+
+        // any
+        B.any = async ([it]) => wrap(iterValues(it.value).some(v => pyBool(v)), 'bool');
+
+        // ascii
+        B.ascii = async ([a]) => {
+            const s = pyRepr(a.value).replace(/[^\x00-\x7F]/g, c => {
+                const cp = c.codePointAt(0);
+                return cp <= 0xFFFF ? `\\u${cp.toString(16).padStart(4,'0')}` : `\\U${cp.toString(16).padStart(8,'0')}`;
+            });
+            return wrap(s, 'str');
+        };
+
+        // bin
+        B.bin = async ([a]) => wrap('0b' + (a.value >>> 0).toString(2), 'str');
+
+        // bool
+        B.bool = async ([a]) => {
+            if (!a) return wrap(false, 'bool');
+            return wrap(pyBool(a.value), 'bool');
+        };
+
+        // bytearray
+        B.bytearray = async ([a]) => {
+            let data;
+            if (!a) data = new Uint8Array(0);
+            else if (typeof a.value === 'number') data = new Uint8Array(a.value);
+            else if (typeof a.value === 'string') data = new TextEncoder().encode(a.value);
+            else if (a.value && a.value.__type__ === 'bytes') data = a.value.data.slice();
+            else data = new Uint8Array(iterValues(a.value));
+            return wrap({ __type__: 'bytearray', data }, 'bytearray');
+        };
+
+        // bytes
+        B.bytes = async ([a]) => {
+            let data;
+            if (!a) data = new Uint8Array(0);
+            else if (typeof a.value === 'number') data = new Uint8Array(a.value);
+            else if (typeof a.value === 'string') data = new TextEncoder().encode(a.value);
+            else data = new Uint8Array(iterValues(a.value));
+            return wrap({ __type__: 'bytes', data }, 'bytes');
+        };
+
+        // callable
+        B.callable = async ([a]) => wrap(a && (a.type === 'func' || a.type === 'builtin'), 'bool');
+
+        // chr
+        B.chr = async ([a]) => wrap(String.fromCodePoint(a.value), 'str');
+
+        // classmethod – for later support
+        B.classmethod = async ([a]) => a;
+
+        // compile – for later support
+        B.compile = async ([src, filename, mode]) => wrap({ __type__: 'code', src: src.value, filename: filename?.value, mode: mode?.value }, 'code');
+
+        // complex
+        B.complex = async ([re, im]) => {
+            const r = re ? Number(re.value) : 0;
+            const i = im ? Number(im.value) : 0;
+            return wrap({ __type__: 'complex', real: r, imag: i }, 'complex');
+        };
+
+        // delattr – for later support
+        B.delattr = async ([obj, name]) => {
+            if (obj.value && typeof obj.value === 'object') delete obj.value[name.value];
+            return wrap(null, 'None');
+        };
+
+        // dict
+        B.dict = async (args) => {
+            return wrap({ __type__: 'dict', data: {} }, 'dict');
+        };
+
+        // dir
+        B.dir = async ([a]) => {
+            let keys = [];
+            if (!a || a.value === null) keys = [];
+            else if (a.value && typeof a.value === 'object' && a.value.__type__ === 'dict') keys = Object.keys(a.value.data);
+            else if (Array.isArray(a.value)) keys = ['append','clear','copy','count','extend','index','insert','pop','remove','reverse','sort'];
+            else if (typeof a.value === 'string') keys = ['capitalize','center','count','encode','endswith','find','format','index','isalnum','isalpha','isdigit','islower','isupper','join','lower','lstrip','replace','rfind','rindex','rsplit','rstrip','split','startswith','strip','title','upper','zfill'];
+            return wrap(keys, 'list');
+        };
+
+        // divmod
+        B.divmod = async ([a, b]) => {
+            const q = Math.floor(a.value / b.value);
+            const r = ((a.value % b.value) + b.value) % b.value;
+            return wrap({ __type__: 'tuple', data: [q, r] }, 'tuple');
+        };
+
+        // enumerate
+        B.enumerate = async ([it, start]) => {
+            const vals = iterValues(it.value);
+            const s = start ? start.value : 0;
+            return wrap(vals.map((v, i) => ({ __type__: 'tuple', data: [i + s, v] })), 'list');
+        };
+
+        // eval
+        B.eval = async ([src]) => await evaluate(src.value.trim(), env);
+
+        // exec
+        B.exec = async ([src]) => {
+            const lines = src.value.split('\n').map((t, i) => tagLine(t, i + 1));
+            await executeBlock(lines, env, 1);
+            return wrap(null, 'None');
+        };
+
+        // filter
+        B.filter = async ([fn, it]) => {
+            const vals = iterValues(it.value);
+            const result = [];
+            for (const v of vals) {
+                const keep = fn.value === null ? pyBool(v) : (await callFunction(fn, [wrap(v, 'obj')], env)).value;
+                if (pyBool(keep)) result.push(v);
+            }
+            return wrap(result, 'list');
+        };
+
+        // float
+        B.float = async ([a]) => wrap(parseFloat(a.value), 'float');
+
+        // format
+        B.format = async ([val, spec]) => {
+            const s = spec ? spec.value : '';
+            let v = val.value;
+            if (s === '') return wrap(pyStr(v), 'str');
+            const m = s.match(/^([<>^]?)(\d*)(\.(\d+))?([dfesg%]?)$/);
+            if (!m) return wrap(pyStr(v), 'str');
+            const [, align, width, , prec, type] = m;
+            let out;
+            if (type === 'd') out = Math.trunc(v).toString();
+            else if (type === 'f') out = Number(v).toFixed(prec !== undefined ? parseInt(prec) : 6);
+            else if (type === 'e') out = Number(v).toExponential(prec !== undefined ? parseInt(prec) : 6);
+            else if (type === '%') out = (Number(v) * 100).toFixed(prec !== undefined ? parseInt(prec) : 6) + '%';
+            else out = pyStr(v);
+            const w = parseInt(width) || 0;
+            if (out.length < w) {
+                if (align === '<') out = out.padEnd(w);
+                else if (align === '>') out = out.padStart(w);
+                else if (align === '^') { const l = Math.floor((w - out.length) / 2); out = ' '.repeat(l) + out + ' '.repeat(w - out.length - l); }
+                else out = out.padStart(w);
+            }
+            return wrap(out, 'str');
+        };
+
+        // frozenset
+        B.frozenset = async ([it]) => {
+            const vals = it ? iterValues(it.value) : [];
+            return wrap({ __type__: 'frozenset', data: new Set(vals) }, 'frozenset');
+        };
+
+        // getattr
+        B.getattr = async ([obj, name, def]) => {
+            try {
+                if (obj.value && typeof obj.value === 'object') {
+                    const v = obj.value[name.value];
+                    if (v !== undefined) return wrap(v, 'obj');
+                }
+                if (def) return def;
+                throw new Error(`AttributeError: object has no attribute '${name.value}'`);
+            } catch(e) { if (def) return def; throw e; }
+        };
+
+        // globals
+        B.globals = async () => {
+            const data = {};
+            for (const [k, v] of Object.entries(globalEnv.variables)) data[k] = v.value;
+            return wrap({ __type__: 'dict', data }, 'dict');
+        };
+
+        // hasattr
+        B.hasattr = async ([obj, name]) => {
+            try { await B.getattr([obj, name]); return wrap(true, 'bool'); }
+            catch { return wrap(false, 'bool'); }
+        };
+
+        // hash
+        B.hash = async ([a]) => {
+            const s = pyRepr(a.value);
+            let h = 0;
+            for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+            return wrap(h, 'int');
+        };
+
+        // help
+        B.help = async ([a]) => {
+            outputToConsole(a ? `Help for: ${pyRepr(a.value)}` : 'JSthon built-in help system');
+            return wrap(null, 'None');
+        };
+
+        // hex
+        B.hex = async ([a]) => wrap('0x' + (a.value >>> 0).toString(16), 'str');
+
+        // id
+        B.id = async ([a]) => {
+            if (!a.value?.__id__) {
+                if (a.value && typeof a.value === 'object') a.value.__id__ = Math.floor(Math.random() * 2**32);
+            }
+            return wrap(a.value?.__id__ ?? 0, 'int');
+        };
+
+        // input
+        B.input = async ([promptArg]) => {
+            const promptText = promptArg ? String(promptArg.value) : '';
+            const userValue = await new Promise((resolve) => {
+                const row = document.createElement('div');
+                row.style.display = 'flex'; row.style.alignItems = 'center'; row.style.gap = '4px';
+                if (promptText) { const label = document.createElement('span'); label.textContent = promptText; row.appendChild(label); }
+                const field = document.createElement('input');
+                field.type = 'text';
+                field.style.cssText = 'border:none;outline:none;background:transparent;font:inherit;color:inherit;flex:1;min-width:4ch;';
+                row.appendChild(field);
+                consoleDiv.appendChild(row);
+                field.focus();
+                field.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') { const val = field.value; field.replaceWith(document.createTextNode(val)); resolve(val); }
+                });
+            });
+            return wrap(userValue, 'str');
+        };
+
+        // int
+        B.int = async ([a, base]) => {
+            if (base) return wrap(parseInt(String(a.value), base.value), 'int');
+            return wrap(typeof a.value === 'string' ? parseInt(a.value, 10) : Math.trunc(a.value), 'int');
+        };
+
+        // isinstance – currently supports strings. a patch will release soon
+        B.isinstance = async ([obj, cls]) => {
+            const t = obj.type;
+            const cn = typeof cls.value === 'string' ? cls.value : cls.value?.name ?? '';
+            const typeMap = { int:'int',float:'float',str:'str',bool:'bool',list:'list',dict:'dict',tuple:'tuple',set:'set',bytes:'bytes',complex:'complex' };
+            return wrap(t === typeMap[cn] || (cn === 'bool' && t === 'bool'), 'bool');
+        };
+
+        // issubclass – for later support
+        B.issubclass = async ([sub, sup]) => wrap(false, 'bool');
+
+        // iter
+        B.iter = async ([it]) => {
+            const vals = iterValues(it.value);
+            let idx = 0;
+            return wrap({ __type__: 'iterator', next: () => idx < vals.length ? { done: false, value: vals[idx++] } : { done: true } }, 'iterator');
+        };
+
+        // len
+        B.len = async ([a]) => {
+            if (Array.isArray(a.value)) return wrap(a.value.length, 'int');
+            if (typeof a.value === 'string') return wrap(a.value.length, 'int');
+            if (a.value?.__type__ === 'dict') return wrap(Object.keys(a.value.data).length, 'int');
+            if (a.value?.__type__ === 'set' || a.value?.__type__ === 'frozenset') return wrap(a.value.data.size, 'int');
+            if (a.value?.__type__ === 'tuple') return wrap(a.value.data.length, 'int');
+            throw new Error(`TypeError: object of type '${a.type}' has no len()`);
+        };
+
+        // list
+        B.list = async ([it]) => {
+            if (!it) return wrap([], 'list');
+            return wrap(iterValues(`${it.value}`), 'list');
+        };
+
+        // locals
+        B.locals = async () => {
+            const data = {};
+            for (const [k, v] of Object.entries(env.variables)) data[k] = v.value;
+            return wrap({ __type__: 'dict', data }, 'dict');
+        };
+
+        // map
+        B.map = async ([fn, ...iters]) => {
+            const arrays = iters.map(it => iterValues(it.value));
+            const len = Math.min(...arrays.map(a => a.length));
+            const result = [];
+            for (let i = 0; i < len; i++) {
+                const args = arrays.map(a => wrap(a[i], 'obj'));
+                result.push((await callFunction(fn, args, env)).value);
+            }
+            return wrap(result, 'list');
+        };
+
+        // max
+        B.max = async (args) => {
+            let vals = args.length === 1 ? iterValues(args[0].value) : args.map(a => a.value);
+            if (vals.length === 0) throw new Error('ValueError: max() arg is an empty sequence');
+            return wrap(vals.reduce((a, b) => a > b ? a : b), 'obj');
+        };
+
+        // memoryview – for later support
+        B.memoryview = async ([a]) => wrap({ __type__: 'memoryview', data: a.value }, 'memoryview');
+
+        // min
+        B.min = async (args) => {
+            let vals = args.length === 1 ? iterValues(args[0].value) : args.map(a => a.value);
+            if (vals.length === 0) throw new Error('ValueError: min() arg is an empty sequence');
+            return wrap(vals.reduce((a, b) => a < b ? a : b), 'obj');
+        };
+
+        // next
+        B.next = async ([it, def]) => {
+            if (it.value?.__type__ === 'iterator') {
+                const r = it.value.next();
+                if (r.done) { if (def) return def; throw new Error('StopIteration'); }
+                return wrap(r.value, 'obj');
+            }
+            throw new Error(`TypeError: '${it.type}' object is not an iterator`);
+        };
+
+        // object – for later support
+        B.object = async () => wrap({ __type__: 'object' }, 'object');
+
+        // oct
+        B.oct = async ([a]) => wrap('0o' + (a.value >>> 0).toString(8), 'str');
+
+        // ord
+        B.ord = async ([a]) => {
+            if (typeof a.value !== 'string' || a.value.length !== 1) throw new Error(`TypeError: ord() expected a character`);
+            return wrap(a.value.codePointAt(0), 'int');
+        };
+
+        // pow
+        B.pow = async ([base, exp, mod]) => {
+            const r = Math.pow(base.value, exp.value);
+            return wrap(mod ? ((r % mod.value) + mod.value) % mod.value : r, 'num');
+        };
+
+        // print
+        B.print = async (args) => {
+            outputToConsole(args.map(a => a.value));
+            return wrap(null, 'None');
+        };
+
+        // property – for later support
+        B.property = async ([fget, fset, fdel, doc]) => {
+            return wrap({ __type__: 'property', fget: fget?.value, fset: fset?.value, fdel: fdel?.value }, 'property');
+        };
+
+        // range
+        B.range = async (args) => {
+            let start, stop, step;
+            if (args.length === 1) { start = 0; stop = args[0].value; step = 1; }
+            else if (args.length === 2) { start = args[0].value; stop = args[1].value; step = 1; }
+            else { start = args[0].value; stop = args[1].value; step = args[2].value; }
+            return wrap({ start, stop, step }, 'range');
+        };
+
+        // repr
+        B.repr = async ([a]) => wrap(pyRepr(a.value), 'str');
+
+        // reversed
+        B.reversed = async ([it]) => wrap([...iterValues(it.value)].reverse(), 'list');
+
+        // round
+        B.round = async ([num, ndigits]) => {
+            if (!ndigits) return wrap(Math.round(num.value), 'int');
+            const factor = Math.pow(10, ndigits.value);
+            return wrap(Math.round(num.value * factor) / factor, 'float');
+        };
+
+        // set
+        B.set = async ([it]) => {
+            const vals = it ? iterValues(it.value) : [];
+            return wrap({ __type__: 'set', data: new Set(vals) }, 'set');
+        };
+
+        // setattr
+        B.setattr = async ([obj, name, val]) => {
+            if (obj.value && typeof obj.value === 'object') obj.value[name.value] = val.value;
+            return wrap(null, 'None');
+        };
+
+        // slice
+        B.slice = async (args) => {
+            let start = null, stop = null, step = null;
+            if (args.length === 1) { stop = args[0].value; }
+            else if (args.length === 2) { start = args[0].value; stop = args[1].value; }
+            else { start = args[0].value; stop = args[1].value; step = args[2].value; }
+            return wrap({ __type__: 'slice', start, stop, step }, 'slice');
+        };
+
+        // sorted
+        B.sorted = async ([it, key, reverse]) => {
+            const vals = [...iterValues(it.value)];
+            if (key && key.value !== null) {
+                const keyed = await Promise.all(vals.map(async v => ({ v, k: (await callFunction(key, [wrap(v, 'obj')], env)).value })));
+                keyed.sort((a, b) => a.k < b.k ? -1 : a.k > b.k ? 1 : 0);
+                const sorted = keyed.map(x => x.v);
+                if (reverse && reverse.value) sorted.reverse();
+                return wrap(sorted, 'list');
+            }
+            vals.sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
+            if (reverse && reverse.value) vals.reverse();
+            return wrap(vals, 'list');
+        };
+
+        // staticmethod – for later support
+        B.staticmethod = async ([a]) => a;
+
+        // str
+        B.str = async ([a]) => wrap(a ? pyStr(a.value) : '', 'str');
+
+        // sum
+        B.sum = async ([it, start]) => {
+            const vals = iterValues(it.value);
+            const s = start ? start.value : 0;
+            return wrap(vals.reduce((acc, v) => acc + v, s), 'num');
+        };
+
+        // super – for later support
+        B.super = async () => wrap({ __type__: 'super' }, 'super');
+
+        // tuple
+        B.tuple = async ([it]) => {
+            const vals = it ? iterValues(it.value) : [];
+            return wrap({ __type__: 'tuple', data: vals }, 'tuple');
+        };
+
+        // type
+        B.type = async ([a]) => {
+            const pyType = (name) => wrap(`<class '${name}'>`, 'str');
+
+            if (!a || a.value === null) return pyType('NoneType');
+            
+            if (typeof a.value === 'boolean') return pyType('bool');
+            
+            if (a.value && typeof a.value === 'object' && a.value.__type__) {
+                return pyType(a.value.__type__);
+            }
+            
+            if (Array.isArray(a.value)) return pyType('list');
+            
+            return pyType(a.type);
+        };
+
+        // vars
+        B.vars = async ([a]) => {
+            if (!a) return B.locals([]);
+            if (a.value && typeof a.value === 'object') {
+                const data = {};
+                for (const [k, v] of Object.entries(a.value)) { if (!k.startsWith('__')) data[k] = v; }
+                return wrap({ __type__: 'dict', data }, 'dict');
+            }
+            throw new Error("TypeError: vars() argument must have __dict__ attribute");
+        };
+
+        // zip
+        B.zip = async (args) => {
+            if (args.length === 0) return wrap([], 'list');
+            const arrays = args.map(a => iterValues(a.value));
+            const len = Math.min(...arrays.map(a => a.length));
+            const result = [];
+            for (let i = 0; i < len; i++) result.push({ __type__: 'tuple', data: arrays.map(a => a[i]) });
+            return wrap(result, 'list');
+        };
+
+        // __import__ – for later support
+        B.__import__ = async ([name]) => {
+            throw new Error(`ImportError: No module named '${name.value}' (import not supported yet)`);
+        };
+
+        return B;
+    }
+
+    // --- evaluate ---
     async function evaluate(expr, env) {
         if (typeof expr === 'string') {
             const s = expr.trim();
             if (/^f["']/.test(s)) return await resolveFString(s, env);
             expr = tokenize(s);
         }
-        if (expr.length === 0) return { value: null, type: 'None' };
+        if (expr.length === 0) return wrap(null, 'None');
         if (expr.length === 2 && expr[0] === 'f' && /^["']/.test(String(expr[1]))) {
             return await resolveFString('f' + expr[1], env);
         }
@@ -148,19 +685,20 @@ async function runCompiler() {
                 else if (t === ')' || t === ']') depth--;
                 else if (depth === 0 && t === logicOp) {
                     const left = await evaluate(expr.slice(0, i), env);
-                    if (logicOp === 'or' && left.value) return { value: true, type: 'bool' };
-                    if (logicOp === 'and' && !left.value) return { value: false, type: 'bool' };
+                    if (logicOp === 'or' && pyBool(left.value)) return wrap(true, 'bool');
+                    if (logicOp === 'and' && !pyBool(left.value)) return wrap(false, 'bool');
                     const right = await evaluate(expr.slice(i + 1), env);
-                    return { value: Boolean(right.value), type: 'bool' };
+                    return wrap(pyBool(right.value), 'bool');
                 }
             }
         }
 
         if (expr[0] === 'not') {
             const val = await evaluate(expr.slice(1), env);
-            return { value: !val.value, type: 'bool' };
+            return wrap(!pyBool(val.value), 'bool');
         }
 
+        // --- resolve function calls ---
         let open;
         while ((open = expr.lastIndexOf('(')) !== -1) {
             let close = expr.indexOf(')', open);
@@ -174,87 +712,68 @@ async function runCompiler() {
             if (sub.length > 0) args.push(await evaluate(sub, env));
 
             if (open > 0 && /^[a-zA-Z_]\w*$/.test(expr[open - 1]) && !['+', '-', '*', '/', '%'].includes(expr[open - 1])) {
-                const func = expr[open - 1]; let res;
-                if (func === 'int') res = { value: parseInt(args[0].value), type: 'int' };
-                else if (func === 'float') res = { value: parseFloat(args[0].value), type: 'float' };
-                else if (func === 'range') {
-                    let start, stop, step;
-                    if (args.length === 1) { start = 0; stop = args[0].value; step = 1; }
-                    else if (args.length === 2) { start = args[0].value; stop = args[1].value; step = 1; }
-                    else { start = args[0].value; stop = args[1].value; step = args[2].value; }
-                    res = { value: { start, stop, step }, type: 'range' };
-                }
-                else if (func === 'len') res = { value: args[0].value.length, type: 'int' };
-                else if (func === 'str') res = { value: String(args[0].value), type: 'str' };
-                else if (func === 'input') {
-                    const promptText = args.length > 0 ? String(args[0].value) : '';
-                    const userValue = await new Promise((resolve) => {
-                        const row = document.createElement('div');
-                        row.style.display = 'flex';
-                        row.style.alignItems = 'center';
-                        row.style.gap = '4px';
-                        if (promptText) {
-                            const label = document.createElement('span');
-                            label.textContent = promptText;
-                            row.appendChild(label);
-                        }
-                        const field = document.createElement('input');
-                        field.type = 'text';
-                        field.style.cssText = 'border:none; outline:none; background:transparent; font:inherit; color:inherit; flex:1; min-width:4ch;';
-                        row.appendChild(field);
-                        consoleDiv.appendChild(row);
-                        field.focus();
-                        field.addEventListener('keydown', (e) => {
-                            if (e.key === 'Enter') {
-                                const val = field.value;
-                                field.replaceWith(document.createTextNode(val));
-                                resolve(val);
-                            }
-                        });
-                    });
-                    res = { value: userValue, type: 'str' };
-                }
-                else {
-                    const fnObj = env.get(func);
-                    if (!fnObj || fnObj.type !== 'func') throw new Error(`TypeError: '${func}' is not callable`);
-                    const { params, body: fnBody, closure } = fnObj.value;
-                    const fnEnv = new Environment(closure, true);
-                    for (let pi = 0; pi < params.length; pi++) {
-                        const { name: pname, defaultExpr } = params[pi];
-                        if (pi < args.length) {
-                            fnEnv.set(pname, args[pi]);
-                        } else if (defaultExpr !== null) {
-                            fnEnv.set(pname, await evaluate(defaultExpr, closure));
-                        } else {
-                            throw new Error(`TypeError: missing required argument '${pname}'`);
-                        }
-                    }
-                    try {
-                        await executeBlock(fnBody, fnEnv);
-                        res = { value: null, type: 'None' };
-                    } catch (ret) {
-                        if (ret && ret.__return__) {
-                            res = ret.typedResult ?? { value: ret.value, type: 'obj' };
-                        } else throw ret;
-                    }
+                const funcName = expr[open - 1];
+                let res;
+
+                // --- lookup ---
+                const builtins = makeBuiltins(env, globalEnv);
+                if (funcName in builtins) {
+                    res = await builtins[funcName](args);
+                } else {
+                    // defs
+                    const fnObj = env.get(funcName);
+                    if (!fnObj || (fnObj.type !== 'func' && fnObj.type !== 'builtin')) throw new Error(`TypeError: '${funcName}' is not callable`);
+                    res = await callFunction(fnObj, args, env);
                 }
                 expr.splice(open - 1, (close - open) + 2, res);
             } else {
-                expr.splice(open, (close - open) + 1, args[0] || { value: null, type: 'None' });
+                expr.splice(open, (close - open) + 1, args[0] || wrap(null, 'None'));
             }
         }
 
+        // --- list indexing ---
         let bOpen;
         while ((bOpen = expr.lastIndexOf('[')) !== -1) {
             let bClose = expr.indexOf(']', bOpen);
             if (bOpen > 0 && (/^[a-zA-Z_]\w*$/.test(expr[bOpen - 1]) || typeof expr[bOpen - 1] === 'object')) {
                 const target = await evaluate([expr[bOpen - 1]], env);
-                const idx = (await evaluate(expr.slice(bOpen + 1, bClose), env)).value;
-                const finalIdx = idx < 0 ? target.value.length + idx : idx;
-                if (!Array.isArray(target.value) || finalIdx < 0 || finalIdx >= target.value.length) {
-                    throw new Error(`IndexError: list index out of range`);
+                const idxExpr = expr.slice(bOpen + 1, bClose);
+
+                // slice support
+                const colonPos = idxExpr.indexOf(':');
+                if (colonPos !== -1) {
+                    const parts = idxExpr.join('').split(':');
+                    const len = Array.isArray(target.value) ? target.value.length : (typeof target.value === 'string' ? target.value.length : 0);
+                    const parseIdx = (s, def) => { const v = s.trim(); return v === '' ? def : parseInt(v); };
+                    let s = parseIdx(parts[0], 0); let e = parseIdx(parts[1], len); const step = parts[2] ? parseIdx(parts[2], 1) : 1;
+                    if (s < 0) s = Math.max(0, len + s); if (e < 0) e = Math.max(0, len + e);
+                    if (Array.isArray(target.value)) {
+                        const sliced = [];
+                        if (step > 0) { for (let i = s; i < Math.min(e, len); i += step) sliced.push(target.value[i]); }
+                        else { for (let i = (s === 0 && parts[0].trim() === '' ? len - 1 : s); i >= Math.max(e + 1, 0); i += step) sliced.push(target.value[i]); }
+                        expr.splice(bOpen - 1, (bClose - bOpen) + 2, wrap(sliced, 'list'));
+                    } else {
+                        expr.splice(bOpen - 1, (bClose - bOpen) + 2, wrap(target.value.slice(s, e), 'str'));
+                    }
+                } else {
+                    const idx = (await evaluate(idxExpr, env)).value;
+                    if (typeof target.value === 'string') {
+                        const fi = idx < 0 ? target.value.length + idx : idx;
+                        expr.splice(bOpen - 1, (bClose - bOpen) + 2, wrap(target.value[fi], 'str'));
+                    } else if (target.value?.__type__ === 'dict') {
+                        const v = target.value.data[idx];
+                        if (v === undefined) throw new Error(`KeyError: ${pyRepr(idx)}`);
+                        expr.splice(bOpen - 1, (bClose - bOpen) + 2, wrap(v, 'obj'));
+                    } else if (target.value?.__type__ === 'tuple') {
+                        const fi = idx < 0 ? target.value.data.length + idx : idx;
+                        expr.splice(bOpen - 1, (bClose - bOpen) + 2, wrap(target.value.data[fi], 'obj'));
+                    } else {
+                        if (!Array.isArray(target.value)) throw new Error(`TypeError: object is not subscriptable`);
+                        const fi = idx < 0 ? target.value.length + idx : idx;
+                        if (fi < 0 || fi >= target.value.length) throw new Error(`IndexError: list index out of range`);
+                        expr.splice(bOpen - 1, (bClose - bOpen) + 2, wrap(target.value[fi], 'obj'));
+                    }
                 }
-                expr.splice(bOpen - 1, (bClose - bOpen) + 2, { value: target.value[finalIdx], type: 'obj' });
             } else {
                 let items = []; let sub = []; let bal = 0;
                 for (let t of expr.slice(bOpen + 1, bClose)) {
@@ -263,15 +782,16 @@ async function runCompiler() {
                     else sub.push(t);
                 }
                 if (sub.length > 0) items.push((await evaluate(sub, env)).value);
-                expr.splice(bOpen, (bClose - bOpen) + 1, { value: items, type: 'list' });
+                expr.splice(bOpen, (bClose - bOpen) + 1, wrap(items, 'list'));
             }
         }
 
-        const ops = [['==', '!=', '<', '>', '<=', '>='], ['+', '-'], ['*', '/', '//', '%']];
+        const ops = [['==', '!=', '<', '>', '<=', '>=', 'in', 'not'], ['+', '-'], ['*', '/', '//', '%']];
         for (let group of ops) {
             for (let i = expr.length - 1; i > 0; i--) {
                 if (group.includes(expr[i])) {
                     if (expr[i] === '-' && (i === 0 || ops.flat().includes(expr[i - 1]))) continue;
+                    if (expr[i] === 'not') continue;
                     const left = await evaluate(expr.slice(0, i), env);
                     const right = await evaluate(expr.slice(i + 1), env);
                     let v;
@@ -287,19 +807,30 @@ async function runCompiler() {
                     else if (expr[i] === '>') v = left.value > right.value;
                     else if (expr[i] === '<=') v = left.value <= right.value;
                     else if (expr[i] === '>=') v = left.value >= right.value;
-                    return { value: v, type: 'obj' };
+                    else if (expr[i] === 'in') {
+                        const rv = right.value;
+                        if (Array.isArray(rv)) v = rv.includes(left.value);
+                        else if (typeof rv === 'string') v = rv.includes(left.value);
+                        else if (rv?.__type__ === 'dict') v = left.value in rv.data;
+                        else if (rv?.__type__ === 'set' || rv?.__type__ === 'frozenset') v = rv.data.has(left.value);
+                        else v = false;
+                    }
+                    return wrap(v, 'obj');
                 }
             }
         }
 
-        if (expr[0] === '-') return { value: -(await evaluate(expr.slice(1), env)).value, type: 'int' };
+        if (expr[0] === '-') return wrap(-(await evaluate(expr.slice(1), env)).value, 'int');
         const item = expr[0];
         if (typeof item === 'object') return item;
-        if (item === 'True') return { value: true, type: 'bool' };
-        if (item === 'False') return { value: false, type: 'bool' };
-        if (item === 'None') return { value: null, type: 'None' };
-        if (!isNaN(item)) return { value: parseFloat(item), type: 'num' };
-        if (item.startsWith('"') || item.startsWith("'")) return { value: item.slice(1, -1), type: 'str' };
+        if (item === 'True') return wrap(true, 'bool');
+        if (item === 'False') return wrap(false, 'bool');
+        if (item === 'None') return wrap(null, 'None');
+        if (!isNaN(item)) {
+            const n = parseFloat(item);
+            return wrap(n, Number.isInteger(n) ? 'int' : 'float');
+        }
+        if (item.startsWith('"') || item.startsWith("'")) return wrap(item.slice(1, -1), 'str');
         return env.get(item);
     }
 
@@ -391,7 +922,7 @@ async function runCompiler() {
                     const header = tagLine(' '.repeat(indent) + trimmed.slice(0, colonIdx + 1), srcLine);
                     const bodyLine = tagLine(' '.repeat(indent + 4) + afterColon, srcLine);
                     lines = [...lines.slice(0, i), header, bodyLine, ...lines.slice(i + 1)];
-                    continue; // re-process same index
+                    continue;
                 }
             }
 
@@ -416,35 +947,28 @@ async function runCompiler() {
                     if (target.includes('[')) {
                         const name = target.split('[')[0].trim();
                         const idx = (await evaluate(target.match(/\[(.*)\]/)[1], env)).value;
-                        const list = env.get(name).value;
-                        list[idx < 0 ? list.length + idx : idx] = newVal.value;
+                        const container = env.get(name).value;
+                        if (Array.isArray(container)) {
+                            container[idx < 0 ? container.length + idx : idx] = newVal.value;
+                        } else if (container?.__type__ === 'dict') {
+                            container.data[idx] = newVal.value;
+                        }
                     } else {
                         const baseName = target;
+                        const augOp = assignMatch[2];
+                        const doAug = (curr, newV, op) => {
+                            if (op === '+') return (Array.isArray(curr) && Array.isArray(newV)) ? [...curr, ...newV] : curr + newV;
+                            return curr - newV;
+                        };
                         if (globalVars.has(baseName)) {
-                            if (assignMatch[2]) {
-                                const curr = env.get(baseName);
-                                const v = assignMatch[2] === '+' ?
-                                    ((Array.isArray(curr.value) && Array.isArray(newVal.value)) ? [...curr.value, ...newVal.value] : curr.value + newVal.value) :
-                                    curr.value - newVal.value;
-                                env.setGlobal(baseName, { value: v, type: 'obj' });
-                            } else { env.setGlobal(baseName, newVal); }
+                            if (augOp) { const curr = env.get(baseName); env.setGlobal(baseName, wrap(doAug(curr.value, newVal.value, augOp), 'obj')); }
+                            else env.setGlobal(baseName, newVal);
                         } else if (nonlocalVars.has(baseName)) {
-                            if (assignMatch[2]) {
-                                const curr = env.getNonlocal(baseName);
-                                const v = assignMatch[2] === '+' ?
-                                    ((Array.isArray(curr.value) && Array.isArray(newVal.value)) ? [...curr.value, ...newVal.value] : curr.value + newVal.value) :
-                                    curr.value - newVal.value;
-                                env.setNonlocal(baseName, { value: v, type: 'obj' });
-                            } else { env.setNonlocal(baseName, newVal); }
+                            if (augOp) { const curr = env.getNonlocal(baseName); env.setNonlocal(baseName, wrap(doAug(curr.value, newVal.value, augOp), 'obj')); }
+                            else env.setNonlocal(baseName, newVal);
                         } else {
-                            if (!assignMatch[2]) env.set(target, newVal);
-                            else {
-                                let curr = env.get(target);
-                                let v = assignMatch[2] === '+' ?
-                                    ((Array.isArray(curr.value) && Array.isArray(newVal.value)) ? [...curr.value, ...newVal.value] : curr.value + newVal.value) :
-                                    curr.value - newVal.value;
-                                env.set(target, { value: v, type: 'obj' });
-                            }
+                            if (!augOp) env.set(target, newVal);
+                            else { const curr = env.get(target); env.set(target, wrap(doAug(curr.value, newVal.value, augOp), 'obj')); }
                         }
                     }
                     i++; continue;
@@ -453,7 +977,7 @@ async function runCompiler() {
                 // --- return ---
                 if (trimmed.startsWith('return')) {
                     const retExpr = trimmed.slice(6).trim();
-                    const retTyped = retExpr ? await evaluate(retExpr, env) : { value: null, type: 'None' };
+                    const retTyped = retExpr ? await evaluate(retExpr, env) : wrap(null, 'None');
                     throw { __return__: true, value: retTyped.value, typedResult: retTyped };
                 }
 
@@ -461,9 +985,9 @@ async function runCompiler() {
                 if (trimmed.match(/^def\s+[a-zA-Z_]\w*\s*\(.*\)\s*:$/)) {
                     const m = trimmed.match(/^def\s+([a-zA-Z_]\w*)\s*\((.*)\)\s*:$/);
                     const name = m[1];
-                    const params = parseParams(m[2]); // parses "x, y=10, z='hi'" correctly
+                    const params = parseParams(m[2]);
                     const { body: fnBody, next } = collectBlock(lines, i + 1, indent);
-                    env.set(name, { value: { params, body: fnBody, closure: env }, type: 'func' });
+                    env.set(name, wrap({ params, body: fnBody, closure: env }, 'func'));
                     i = next; continue;
                 }
 
@@ -497,7 +1021,7 @@ async function runCompiler() {
                         const { body, next } = collectBlock(lines, k + 1, indent);
                         if (!executed) {
                             const condResult = (m[1] === 'else') ? true : (await evaluate(m[2], env)).value;
-                            if (condResult) {
+                            if (pyBool(condResult)) {
                                 await executeBlock(body, env, srcLine);
                                 executed = true;
                             }
@@ -520,20 +1044,22 @@ async function runCompiler() {
                     if (trimmed.startsWith('for ')) {
                         const m = trimmed.match(/^for\s+(.+)\s+in\s+(.+):$/);
                         const iter = await evaluate(m[2], env);
-                        let vals;
-                        if (iter.type === 'range') {
-                            vals = [];
-                            const { start, stop, step } = iter.value;
-                            if (step > 0) { for (let v = start; v < stop; v += step) vals.push(v); }
-                            else { for (let v = start; v > stop; v += step) vals.push(v); }
-                        } else { vals = iter.value; }
+                        const vals = iterValues(iter.value);
                         for (let v of vals) {
-                            env.set(m[1], { value: v, type: 'obj' });
+                            // Tuple unpacking
+                            const varPart = m[1].trim();
+                            if (varPart.includes(',')) {
+                                const names = varPart.split(',').map(n => n.trim());
+                                const items = v && v.__type__ === 'tuple' ? v.data : (Array.isArray(v) ? v : [v]);
+                                names.forEach((n, idx) => env.set(n, wrap(items[idx] ?? null, 'obj')));
+                            } else {
+                                env.set(varPart, wrap(v, 'obj'));
+                            }
                             await executeBlock(body, env, srcLine);
                         }
                     } else {
                         const cond = trimmed.match(/^while\s+(.+):$/)[1];
-                        while ((await evaluate(cond, env)).value === true) await executeBlock(body, env, srcLine);
+                        while (pyBool((await evaluate(cond, env)).value)) await executeBlock(body, env, srcLine);
                     }
                     i = next; continue;
                 }
@@ -541,6 +1067,27 @@ async function runCompiler() {
                 // --- standalone call ---
                 if (/^[a-zA-Z_]\w*\s*\(/.test(trimmed)) {
                     await evaluate(trimmed, env);
+                    i++; continue;
+                }
+
+                // --- method calls ---
+                const methodMatch = trimmed.match(/^([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\((.*)\)$/);
+                if (methodMatch) {
+                    const [, objName, method, argsRaw] = methodMatch;
+                    const obj = env.get(objName);
+                    let mArgs = [];
+                    if (argsRaw.trim()) {
+                        let sub = [], bal = 0, inStr = false;
+                        for (const c of argsRaw) {
+                            if (c === '"' || c === "'") inStr = !inStr;
+                            if (!inStr && (c === '(' || c === '[')) bal++;
+                            if (!inStr && (c === ')' || c === ']')) bal--;
+                            if (c === ',' && bal === 0 && !inStr) { mArgs.push(await evaluate(sub.join(''), env)); sub = []; }
+                            else sub.push(c);
+                        }
+                        if (sub.length) mArgs.push(await evaluate(sub.join(''), env));
+                    }
+                    await dispatchMethod(obj, method, mArgs, env, objName);
                     i++; continue;
                 }
 
@@ -553,8 +1100,108 @@ async function runCompiler() {
         }
     }
 
+    // --- method dispatch ---
+    async function dispatchMethod(obj, method, args, env, objName) {
+        const v = obj.value;
+
+        // LIST methods
+        if (Array.isArray(v)) {
+            if (method === 'append') { v.push(args[0].value); return; }
+            if (method === 'extend') { v.push(...iterValues(args[0].value)); return; }
+            if (method === 'insert') { v.splice(args[0].value, 0, args[1].value); return; }
+            if (method === 'pop') { const idx = args[0]?.value ?? -1; const fi = idx < 0 ? v.length + idx : idx; v.splice(fi, 1); return; }
+            if (method === 'remove') { const idx = v.indexOf(args[0].value); if (idx === -1) throw new Error('ValueError: value not in list'); v.splice(idx, 1); return; }
+            if (method === 'clear') { v.length = 0; return; }
+            if (method === 'reverse') { v.reverse(); return; }
+            if (method === 'sort') { v.sort((a, b) => a < b ? -1 : a > b ? 1 : 0); return; }
+            if (method === 'index') { const idx = v.indexOf(args[0].value); if (idx === -1) throw new Error('ValueError: value not in list'); return wrap(idx, 'int'); }
+            if (method === 'count') { return wrap(v.filter(x => x === args[0].value).length, 'int'); }
+            if (method === 'copy') { return wrap([...v], 'list'); }
+        }
+
+        // DICT methods
+        if (v?.__type__ === 'dict') {
+            if (method === 'get') { const r = v.data[args[0].value]; return wrap(r !== undefined ? r : (args[1]?.value ?? null), 'obj'); }
+            if (method === 'keys') { return wrap(Object.keys(v.data).map(k => isNaN(k) ? k : Number(k)), 'list'); }
+            if (method === 'values') { return wrap(Object.values(v.data), 'list'); }
+            if (method === 'items') { return wrap(Object.entries(v.data).map(([k, val]) => ({ __type__: 'tuple', data: [isNaN(k) ? k : Number(k), val] })), 'list'); }
+            if (method === 'update') { Object.assign(v.data, args[0].value?.data ?? {}); return; }
+            if (method === 'pop') { const r = v.data[args[0].value]; delete v.data[args[0].value]; return wrap(r, 'obj'); }
+            if (method === 'clear') { for (const k in v.data) delete v.data[k]; return; }
+            if (method === 'setdefault') { if (!(args[0].value in v.data)) v.data[args[0].value] = args[1]?.value ?? null; return wrap(v.data[args[0].value], 'obj'); }
+            if (method === 'copy') { return wrap({ __type__: 'dict', data: { ...v.data } }, 'dict'); }
+        }
+
+        // SET methods
+        if (v?.__type__ === 'set') {
+            if (method === 'add') { v.data.add(args[0].value); return; }
+            if (method === 'remove') { if (!v.data.has(args[0].value)) throw new Error('KeyError'); v.data.delete(args[0].value); return; }
+            if (method === 'discard') { v.data.delete(args[0].value); return; }
+            if (method === 'pop') { const first = [...v.data][0]; v.data.delete(first); return wrap(first, 'obj'); }
+            if (method === 'clear') { v.data.clear(); return; }
+            if (method === 'union') { return wrap({ __type__: 'set', data: new Set([...v.data, ...args[0].value.data]) }, 'set'); }
+            if (method === 'intersection') { return wrap({ __type__: 'set', data: new Set([...v.data].filter(x => args[0].value.data.has(x))) }, 'set'); }
+            if (method === 'difference') { return wrap({ __type__: 'set', data: new Set([...v.data].filter(x => !args[0].value.data.has(x))) }, 'set'); }
+            if (method === 'issubset') { return wrap([...v.data].every(x => args[0].value.data.has(x)), 'bool'); }
+            if (method === 'issuperset') { return wrap([...args[0].value.data].every(x => v.data.has(x)), 'bool'); }
+            if (method === 'update') { for (const x of iterValues(args[0].value)) v.data.add(x); return; }
+            if (method === 'copy') { return wrap({ __type__: 'set', data: new Set(v.data) }, 'set'); }
+        }
+
+        // STRING methods
+        if (typeof v === 'string') {
+            if (method === 'upper') return wrap(v.toUpperCase(), 'str');
+            if (method === 'lower') return wrap(v.toLowerCase(), 'str');
+            if (method === 'strip') return wrap(v.trim(), 'str');
+            if (method === 'lstrip') return wrap(v.trimStart(), 'str');
+            if (method === 'rstrip') return wrap(v.trimEnd(), 'str');
+            if (method === 'split') {
+                const sep = args[0]?.value ?? null;
+                const maxsplit = args[1]?.value ?? -1;
+                let parts = sep === null ? v.trim().split(/\s+/) : (maxsplit >= 0 ? v.split(sep).slice(0, maxsplit + 1) : v.split(sep));
+                return wrap(parts, 'list');
+            }
+            if (method === 'rsplit') {
+                const sep = args[0]?.value ?? null;
+                const maxsplit = args[1]?.value ?? -1;
+                let parts = sep === null ? v.trim().split(/\s+/) : v.split(sep);
+                if (maxsplit >= 0) parts = [...parts.slice(0, parts.length - maxsplit - 1), parts.slice(parts.length - maxsplit - 1).join(sep)];
+                return wrap(parts, 'list');
+            }
+            if (method === 'join') return wrap(iterValues(args[0].value).join(v), 'str');
+            if (method === 'replace') return wrap(v.split(args[0].value).join(args[1].value), 'str');
+            if (method === 'startswith') return wrap(v.startsWith(args[0].value), 'bool');
+            if (method === 'endswith') return wrap(v.endsWith(args[0].value), 'bool');
+            if (method === 'find') return wrap(v.indexOf(args[0].value), 'int');
+            if (method === 'rfind') return wrap(v.lastIndexOf(args[0].value), 'int');
+            if (method === 'index') { const idx = v.indexOf(args[0].value); if (idx === -1) throw new Error('ValueError: substring not found'); return wrap(idx, 'int'); }
+            if (method === 'rindex') { const idx = v.lastIndexOf(args[0].value); if (idx === -1) throw new Error('ValueError: substring not found'); return wrap(idx, 'int'); }
+            if (method === 'count') return wrap(v.split(args[0].value).length - 1, 'int');
+            if (method === 'isdigit') return wrap(/^\d+$/.test(v), 'bool');
+            if (method === 'isalpha') return wrap(/^[a-zA-Z]+$/.test(v), 'bool');
+            if (method === 'isalnum') return wrap(/^[a-zA-Z0-9]+$/.test(v), 'bool');
+            if (method === 'isupper') return wrap(v === v.toUpperCase() && /[a-zA-Z]/.test(v), 'bool');
+            if (method === 'islower') return wrap(v === v.toLowerCase() && /[a-zA-Z]/.test(v), 'bool');
+            if (method === 'isspace') return wrap(/^\s+$/.test(v) && v.length > 0, 'bool');
+            if (method === 'capitalize') return wrap(v.charAt(0).toUpperCase() + v.slice(1).toLowerCase(), 'str');
+            if (method === 'title') return wrap(v.replace(/\b\w/g, c => c.toUpperCase()), 'str');
+            if (method === 'center') { const w = args[0].value; const fill = args[1]?.value ?? ' '; const pad = Math.max(0, w - v.length); const lpad = Math.floor(pad / 2); return wrap(fill.repeat(lpad) + v + fill.repeat(pad - lpad), 'str'); }
+            if (method === 'zfill') return wrap(v.padStart(args[0].value, '0'), 'str');
+            if (method === 'encode') return wrap({ __type__: 'bytes', data: new TextEncoder().encode(v) }, 'bytes');
+            if (method === 'format') {
+                let result = v;
+                args.forEach((a, idx) => { result = result.replace(new RegExp(`\\{${idx}\\}`, 'g'), pyStr(a.value)); });
+                return wrap(result, 'str');
+            }
+            if (method === 'expandtabs') return wrap(v.replace(/\t/g, ' '.repeat(args[0]?.value ?? 8)), 'str');
+            if (method === 'partition') { const idx = v.indexOf(args[0].value); if (idx === -1) return wrap({ __type__: 'tuple', data: [v, '', ''] }, 'tuple'); return wrap({ __type__: 'tuple', data: [v.slice(0, idx), args[0].value, v.slice(idx + args[0].value.length)] }, 'tuple'); }
+        }
+
+        throw new Error(`AttributeError: '${obj.type}' object has no attribute '${method}'`);
+    }
+
     const sourceLines = code.split('\n').map((text, idx) => tagLine(text, idx + 1));
     await executeBlock(sourceLines, globalEnv, 1);
 }
 
-console.log("Powered by JSthon v1.0.0");
+console.log("Powered by JSthon v1.1.0");
