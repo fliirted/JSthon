@@ -1,18 +1,18 @@
-# JSthon ![version](https://img.shields.io/badge/version-2.0.0-yellow)
+# Pyrite.js ![version](https://img.shields.io/badge/version-2.0.0-yellow)
 
-JSthon is a lightweight Python interpreter written in JavaScript that runs directly in the browser. It features a custom lexical tokenizer and an environment-based scoping system to mimic Python's execution model.
+Pyrite is a lightweight Python interpreter written in JavaScript that runs directly in the browser. It features a custom lexical tokenizer and an environment-based scoping system to mimic Python's execution model.
 
 ### Quick Start
 
-Integrate JSthon into any web project with just a few lines of HTML:
+Integrate Pyrite into any web project with just a few lines of HTML:
 
 ```html
-<textarea id="editor">print("Hello, JSthon!")</textarea>
+<textarea id="editor">print("Hello, Pyrite!")</textarea>
 <div id="console"></div>
 
 <button onclick="runCompiler()">Execute Code</button>
 
-<script src="https://cdn.jsdelivr.net/gh/fliirted/jsthon/dist/jsthon.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/fliirted/Pyrite/dist/Pyrite.min.js"></script>
 ```
 
 ### Features
@@ -26,7 +26,7 @@ Integrate JSthon into any web project with just a few lines of HTML:
 - **Errors:** Python style tracebacks.
 
 ### Architecture
-JSthon operates in three main stages:
+Pyrite operates in three main stages:
 1. **Tokenizer:** Uses regex to convert raw text into a stream of symbols.
 2. **Environment:** A recursive tree structure managing variable bindings and scope inheritance.
 3. **Evaluator:** An asynchronous engine handling blocks, function calls, and operator precedence.
@@ -49,7 +49,7 @@ print(f"Next value: {counter()}")
 - **Dot Notation:** Full support for object and string methods (e.g., `.staticmethod()`, `.classmethod()`, `.property()`. Many are now supported).
 - **Dictionaries:** Implementation of key-value pair data structures.
 - **Error Handling:** More descriptive Tracebacks and `try/except` blocks.
-- **Modules:** A system to `import` external JSthon scripts.
+- **Modules:** A system to `import` external Pyrite scripts.
 
 ### Version Notation
 `Major.Minor.Patch`
