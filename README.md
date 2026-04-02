@@ -12,7 +12,7 @@ Integrate Pyrite into any web project with just a few lines of HTML:
 
 <button onclick="runCompiler()">Execute Code</button>
 
-<script src="https://cdn.jsdelivr.net/gh/fliirted/Pyrite/dist/Pyrite.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/fliirted/pyrite/dist/pyrite.min.js"></script>
 ```
 
 ### Features
